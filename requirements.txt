@@ -5,7 +5,6 @@ datasets>=2.18.0
 sentencepiece>=0.1.99
 numpy>=1.23
 tqdm>=4.66
-ngram
 
 # LAMB optimizer (only needed for --lamb). Limited to Linux where wheels are available.
 bitsandbytes>=0.41.1; platform_system == "Linux"
