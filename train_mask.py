@@ -12,7 +12,7 @@ from datasets import load_dataset, load_from_disk
 
 from preprocessing import tokenize, padding_collate_fn, group_texts
 
-# bitsandbytes is optional; import LAMB only when requested via --lamb
+from bitsandbytes.optim import LAMB
 
 try:
     import wandb
@@ -57,7 +57,6 @@ parser.add_argument("--lamb", action="store_true", help="LAMB optimization")
 parser.add_argument("--lower", action="store_true", help="Lowercase")
 parser.add_argument("--soft", action="store_true", help="Soft mask")
 parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
-parser.add_argument("--fp32", action="store_true", help="Disable bf16 autocast; run in FP32")
 parser.add_argument("--mask_decay", type=float, default=0.0, help="Mask decay. e.g. 0.1 means decay by 0.1 \
                     over the course of training")
 
@@ -75,7 +74,7 @@ def evaluate(model, tokenizer, dataloader, args):
             # split batch into grad_acc chunks
             batches = split_batch(masked_batch, args)
             for minibatch in batches:
-                with (torch.autocast(dtype=torch.bfloat16, device_type="cuda") if not args.fp32 else torch.autocast(enabled=False, device_type="cuda")):
+                with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
                     outputs = model(**move_dict_to_cuda(minibatch))
             
                 avg_loss += outputs.loss.item()
@@ -245,10 +244,10 @@ def split_batch(batch, args):
     return batches
 
 def move_dict_to_cuda(d):
-    return {key: value.to(device="cuda") for key, value in d.items()}
+    return {key: value.to(device="cuda:0") for key, value in d.items()}
 
 def move_dict_to_cuda_bf16(d):
-    return {key: value.to(dtype=torch.bfloat16, device="cuda") for key, value in d.items()}
+    return {key: value.to(dtype=torch.bfloat16, device="cuda:0") for key, value in d.items()}
 
 
 def reset_stats(mask_stats):
@@ -316,23 +315,16 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
 
     if args.lamb:
-        try:
-            from bitsandbytes.optim import LAMB
-        except Exception as e:
-            raise RuntimeError("--lamb requested, but bitsandbytes is not installed or failed to load.") from e
         optimizer = LAMB(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-08, weight_decay=0.1)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=args.weight_decay)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=args.total_steps//100, num_training_steps=args.total_steps)
 
     model.train()
-    if args.fp32:
-        model = model.to(device="cuda")
-    else:
-        model = model.to(dtype=torch.bfloat16, device="cuda")
+    model = model.to(dtype=torch.bfloat16, device="cuda:0")
 
 
-    mask_weights = torch.full((tokenizer.vocab_size,), args.mlm_prob).to(device="cuda")
+    mask_weights = torch.full((tokenizer.vocab_size,), args.mlm_prob).to(device="cuda:0")
     mask_stats = {
         'correct': torch.zeros(tokenizer.vocab_size), 
         'incorrect': torch.zeros(tokenizer.vocab_size),
@@ -375,7 +367,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 
                 for minibatch in batches:
 
-                    with (torch.autocast(dtype=torch.bfloat16, device_type="cuda") if not args.fp32 else torch.autocast(enabled=False, device_type="cuda")):
+                    with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
                         if args.flops:
                             model.eval()
                             flops = FlopCountAnalysis(model, tuple(move_dict_to_cuda(minibatch).values()))
@@ -404,12 +396,12 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 if not args.regular_mlm:
                     if args.soft:
                         mask_stats = get_batch_accuracy_soft(
-                            masked_batch["input_ids"].to(device="cuda"), 
+                            masked_batch["input_ids"].to(device="cuda:0"), 
                             all_logits, 
-                            masked_batch["labels"].to(device="cuda"), 
+                            masked_batch["labels"].to(device="cuda:0"), 
                             mask_stats)
                     else:
-                        mask_stats = get_batch_accuracy(all_logits, masked_batch["labels"].to(device="cuda"), mask_stats)
+                        mask_stats = get_batch_accuracy(all_logits, masked_batch["labels"].to(device="cuda:0"), mask_stats)
 
                 if global_step % args.mask_update_steps == 0 and global_step != 0 and not args.regular_mlm:
                     if args.soft:
