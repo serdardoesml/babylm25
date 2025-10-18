@@ -102,12 +102,8 @@ def regroup_texts(args, max_seq_len):
         desc = "Grouping",
         # load_from_cache_file=False,
         )
-    change_ratio = cur_max_seq_len / max_seq_len
-    grad_acc_change = args.grad_acc * change_ratio
-    if grad_acc_change >= 1 and int(grad_acc_change) == grad_acc_change:
-        args.grad_acc = int(grad_acc_change)
-    else:
-        args.batch_size = int(args.batch_size * change_ratio)
+    change_ratio = max_seq_len / cur_max_seq_len
+    args.batch_size = max(1, int(args.batch_size / change_ratio))
     
     train_dataloader = torch.utils.data.DataLoader(
         grouped_dataset['train'], 
@@ -398,7 +394,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                                     mask_stats,
                                 )
 
-                    loss = loss / args.grad_acc # To ensure consistent gradient magnitudes
+                    loss = loss / args.grad_acc # To ensure consistent gradient magnitude
                     loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
