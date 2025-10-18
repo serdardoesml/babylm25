@@ -354,7 +354,6 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                     args.max_seq_len = args.max_seq_len[1:]
 
             for step, batch in enumerate(train_dataloader):
-                all_logits = None
                 masked_batch = mask_batch(batch, 
                                           tokenizer, mask_weights.to(device="cpu"), 
                                           mlm_prob=args.mlm_prob, 
@@ -382,9 +381,24 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                         outputs = model(**move_dict_to_cuda(minibatch))
                         loss = outputs.loss
 
-                        # accumulate logits
-                        all_logits = outputs.logits if all_logits is None else torch.cat((all_logits, outputs.logits), dim=0)
+                    # Update stats per-minibatch and discard logits
+                    if not args.regular_mlm:
+                        with torch.no_grad():
+                            if args.soft:
+                                mask_stats = get_batch_accuracy_soft(
+                                    minibatch["input_ids"].to(device="cuda:0"),
+                                    outputs.logits.detach(),
+                                    minibatch["labels"].to(device="cuda:0"),
+                                    mask_stats,
+                                )
+                            else:
+                                mask_stats = get_batch_accuracy(
+                                    outputs.logits.detach(),
+                                    minibatch["labels"].to(device="cuda:0"),
+                                    mask_stats,
+                                )
 
+                    loss = loss / args.grad_acc # To ensure consistent gradient magnitudes
                     loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -392,16 +406,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # need to do on cuda to be fast
-                if not args.regular_mlm:
-                    if args.soft:
-                        mask_stats = get_batch_accuracy_soft(
-                            masked_batch["input_ids"].to(device="cuda:0"), 
-                            all_logits, 
-                            masked_batch["labels"].to(device="cuda:0"), 
-                            mask_stats)
-                    else:
-                        mask_stats = get_batch_accuracy(all_logits, masked_batch["labels"].to(device="cuda:0"), mask_stats)
+                # stats already updated per-minibatch; nothing to do here
 
                 if global_step % args.mask_update_steps == 0 and global_step != 0 and not args.regular_mlm:
                     if args.soft:
