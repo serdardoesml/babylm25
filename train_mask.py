@@ -61,6 +61,7 @@ parser.add_argument("--flops", action="store_true", help="Compute FLOPs")
 parser.add_argument("--mask_decay", type=float, default=0.0, help="Mask decay. e.g. 0.1 means decay by 0.1 \
                     over the course of training")
 
+# ------------------------- Eval -------------------------
 def evaluate(model, tokenizer, dataloader, args):
     model.eval()
     correct = 0
@@ -69,20 +70,20 @@ def evaluate(model, tokenizer, dataloader, args):
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
             if len(batch["input_ids"]) == 0:
-                continue # NOTE: not sure why this happens in 100M case...
+                continue  # NOTE: not sure why this happens in 100M case...
 
             masked_batch = mask_batch(batch, tokenizer, mask_weights=None, mlm_prob=0.15, mask_replace_prob=0.8, random_replace_prob=0.1)
-            # split batch into grad_acc chunks
             batches = split_batch(masked_batch, args)
             for minibatch in batches:
-                with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
+                with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
                     outputs = model(**move_dict_to_cuda(minibatch))
-            
+
                 avg_loss += outputs.loss.item()
                 logits = outputs.logits
                 preds = logits.argmax(dim=-1)
 
-                labels = minibatch["labels"].to(device=logits.device, dtype=logits.dtype)
+                # keep labels as int64 for comparison
+                labels = minibatch["labels"].to(device=logits.device)
                 label_mask = labels != -100
                 correct += (preds[label_mask] == labels[label_mask]).sum().item()
                 total += preds[label_mask].numel()
@@ -90,42 +91,41 @@ def evaluate(model, tokenizer, dataloader, args):
     model.train()
     return {'acc': 100 * correct / total, 'loss': avg_loss / (len(dataloader) * args.grad_acc)}
 
-
+# ------------------------- Grouping -------------------------
 def regroup_texts(args, max_seq_len):
     cur_max_seq_len = args.cur_max_seq_len
     print("CUR MAX SEQ LEN:", cur_max_seq_len)
 
-    grouped_dataset = args.dataset.map(group_texts,
-        batched = True,
-        fn_kwargs = {'max_len': max_seq_len},
-        # remove_columns = dataset["train"].column_names,
+    grouped_dataset = args.dataset.map(
+        group_texts,
+        batched=True,
+        fn_kwargs={'max_len': max_seq_len},
         num_proc=args.cpus,
-        desc = "Grouping",
-        # load_from_cache_file=False,
-        )
+        desc="Grouping",
+    )
     change_ratio = max_seq_len / cur_max_seq_len
     args.batch_size = max(1, int(args.batch_size / change_ratio))
-    
+
     train_dataloader = torch.utils.data.DataLoader(
-        grouped_dataset['train'], 
-        batch_size=args.batch_size, 
+        grouped_dataset['train'],
+        batch_size=args.batch_size,
         num_workers=args.cpus,
-        shuffle=True, 
+        shuffle=True,
         collate_fn=padding_collate_fn
-        )
-    
+    )
+
     eval_dataloader = torch.utils.data.DataLoader(
-        grouped_dataset['validation'], 
-        batch_size=args.batch_size, 
+        grouped_dataset['validation'],
+        batch_size=args.batch_size,
         num_workers=args.cpus,
-        shuffle=False, 
+        shuffle=False,
         collate_fn=padding_collate_fn
-        )
+    )
 
     args.cur_max_seq_len = max_seq_len
-
     return train_dataloader, eval_dataloader
 
+# ------------------------- Masking -------------------------
 def mask_batch(batch, tokenizer, mask_weights=None, mlm_prob=0.15, mask_replace_prob=0.8, random_replace_prob=0.1):
     if mask_weights is None:
         mask_weights = torch.full((tokenizer.vocab_size,), mlm_prob, device=batch["input_ids"].device)
@@ -133,15 +133,15 @@ def mask_batch(batch, tokenizer, mask_weights=None, mlm_prob=0.15, mask_replace_
     for i in range(len(batch["input_ids"])):
         enc = batch["input_ids"][i]
 
-        enc_mask_weights = mask_weights[enc] # weights for each token
-        enc_mask_weights[enc == tokenizer.pad_token_id] = 0 # dont mask pad tokens
+        enc_mask_weights = mask_weights[enc]  # weights per token id
+        enc_mask_weights[enc == tokenizer.pad_token_id] = 0  # don't mask PAD
 
-        enc_mask_weights = mlm_prob * len(enc) * enc_mask_weights / enc_mask_weights.sum() # normalize to avg .15
+        enc_mask_weights = mlm_prob * len(enc) * enc_mask_weights / enc_mask_weights.sum()  # normalize to avg .15
 
-        enc_mask_mask = torch.rand(len(enc)) < enc_mask_weights # tokens to mask/replace
+        enc_mask_mask = torch.rand(len(enc)) < enc_mask_weights  # tokens to mask/replace
         rand = torch.rand(len(enc))
-        to_mask = rand < mask_replace_prob # tokens to replace with mask
-        to_replace = (rand > mask_replace_prob) & (rand < mask_replace_prob + random_replace_prob) # tokens to replace randomly
+        to_mask = rand < mask_replace_prob  # replace with [MASK]
+        to_replace = (rand > mask_replace_prob) & (rand < mask_replace_prob + random_replace_prob)  # random token
 
         to_mask = to_mask & enc_mask_mask
         to_replace = to_replace & enc_mask_mask
@@ -158,80 +158,168 @@ def mask_batch(batch, tokenizer, mask_weights=None, mlm_prob=0.15, mask_replace_
 
     return masked_batch
 
-
+# ------------------------- Hard stats -------------------------
 def get_batch_accuracy(logits, labels, prev_stats):
     vocab_size = logits.shape[-1]
-
-    # Mask out ignored labels
     mask = labels != -100
     labels = labels[mask]
     preds = logits.argmax(dim=-1)[mask]
-
-    # Get match mask
     correct_mask = preds == labels
-
-    # Use bincount on correct and incorrect
     correct_counts = torch.bincount(labels[correct_mask], minlength=vocab_size)
     incorrect_counts = torch.bincount(labels[~correct_mask], minlength=vocab_size)
-
     prev_stats['correct'] += correct_counts
     prev_stats['incorrect'] += incorrect_counts
-
     return prev_stats
 
 def update_mask_weights(mask_weights, mask_stats, mlm_prob=0.15):
     correct_pct = (mask_stats['correct'] + 0.5) / (mask_stats['incorrect'] + mask_stats['correct'] + 1)
-    # if there are no instances, treated as 50% accuracy
-    # things that never show up will go to 7.5% mlm_prob (seems fine?)
-
     new_weights = mlm_prob - (correct_pct * mlm_prob)
     mask_weights = 0.2 * mask_weights + 0.8 * new_weights
-
     mask_weights = mask_weights.clamp(0.005)
-    mask_weights = mlm_prob * mask_weights.shape[0] * mask_weights / mask_weights.sum() # normalize back to mlm_prob
-
+    mask_weights = mlm_prob * mask_weights.shape[0] * mask_weights / mask_weights.sum()
     return mask_weights
 
+# ------------------------- Soft stats (as-is) -------------------------
 def get_batch_accuracy_soft(masked_inputs, logits, labels, prev_stats):
     with torch.no_grad():
         vocab_size = logits.shape[-1]
-
         loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
         loss = loss_fn(logits.view(-1, vocab_size), labels.view(-1))
         loss = loss.view(masked_inputs.shape)
-
-        # Mask out ignored labels and replaced tokens
-        mask = masked_inputs == 4 # mask_token_id
-
+        # your convention: only positions that are actual [MASK] tokens
+        mask = masked_inputs == 4  # mask_token_id (kept as you prefer)
         loss = loss[mask]
         labels = labels[mask]
-
         prev_stats['loss'].scatter_add_(0, labels, loss)
         prev_stats['total'].scatter_add_(0, labels, torch.ones_like(loss))
-
         return prev_stats
-    
-def update_mask_weights_soft(mask_weights, mask_stats, mlm_prob=0.15):
-    max_loss = torch.log(torch.tensor(mask_weights.shape[0])).item() # e.g. log(40000) = 10.5966, uniform guess
-    avgs = mask_stats['loss'] / mask_stats['total']
-    norm_loss = avgs / max_loss
 
-    # min-max normalize and invert
-    norm_loss = 1 - (norm_loss - norm_loss.min()) / (norm_loss.max() - norm_loss.min())
+# ------------------------- Robust soft update + content-only prior -------------------------
+@torch.no_grad()
+def content_fullsoft_counts_first_layer(model, tokenizer, input_ids, labels, attention_mask=None):
+    """
+    Full soft-weighting content-only neighbors from layer-0:
+      - Teacher IDs (fill masked positions with true labels)
+      - Embedding lookup -> layer-0 Wq/Wk -> softmax over keys
+      - Accumulate probabilities per vocab id for *masked* query positions
+    """
+    was_training = model.training
+    model.eval()
 
-    new_weights = mlm_prob - (norm_loss * mlm_prob)
-    mask_weights = 0.2 * mask_weights + 0.8 * new_weights
+    device = input_ids.device
+    V = tokenizer.vocab_size
+    counts = torch.zeros(V, device=device, dtype=torch.float32)
 
-    mask_weights = mask_weights.clamp(0.005)
-    mask_weights = mlm_prob * mask_weights.shape[0] * mask_weights / mask_weights.sum() # normalize back to mlm_prob
+    # Teacher IDs: use ground-truth at supervised positions
+    teacher_ids = input_ids.clone()
+    sup_mask = (labels != -100)
+    teacher_ids[sup_mask] = labels[sup_mask]
 
-    return mask_weights
+    # Attention mask fallback
+    if attention_mask is None:
+        attention_mask = (input_ids != tokenizer.pad_token_id).long()
 
+    # Layer-0 embeddings (pure token content)
+    E = model.deberta.embeddings.word_embeddings(teacher_ids)  # (B,T,d)
+
+    # Layer-0 content projections
+    sa0 = model.deberta.encoder.layer[0].attention.self
+    Q = sa0.query_proj(E)   # (B,T,d)
+    K = sa0.key_proj(E)     # (B,T,d)
+
+    B, T, D = Q.shape
+    H = sa0.num_attention_heads
+    Dh = sa0.attention_head_size
+    assert D == H * Dh, "Hidden dim mismatch for heads"
+
+    # Reshape to heads
+    Qh = Q.view(B, T, H, Dh).permute(0, 2, 1, 3)           # (B,H,T,Dh)
+    Kh = K.view(B, T, H, Dh).permute(0, 2, 3, 1)           # (B,H,Dh,T)
+
+    # Content-only logits
+    scores = torch.matmul(Qh, Kh) / (Dh ** 0.5)            # (B,H,T,T)
+
+    # Mask keys (padding)
+    key_mask = attention_mask[:, None, None, :]            # (B,1,1,T)
+    scores = scores.masked_fill(key_mask == 0, float("-inf"))
+
+    # Softmax over keys; average heads
+    probs = torch.softmax(scores, dim=-1).mean(dim=1)      # (B,T,T)
+
+    mask_token_id = tokenizer.mask_token_id
+    special_ids = {tokenizer.pad_token_id, tokenizer.cls_token_id, tokenizer.sep_token_id}
+    special_ids = {sid for sid in special_ids if sid is not None}
+
+    for b in range(B):
+        idxs = (input_ids[b] == mask_token_id).nonzero(as_tuple=True)[0]
+        if idxs.numel() == 0:
+            continue
+
+        # Exclude specials and self when accumulating
+        special_mask = torch.zeros(T, dtype=torch.bool, device=device)
+        if len(special_ids) > 0:
+            special_mask |= torch.isin(teacher_ids[b], torch.tensor(sorted(list(special_ids)), device=device))
+
+        valid_keys = (attention_mask[b] == 1) & (~special_mask)
+
+        for i in idxs.tolist():
+            w = probs[b, i].clone()                         # (T,)
+            w[i] = 0.0                                      # drop self
+            w = w * valid_keys.float()
+            s = w.sum()
+            if s > 0:
+                w = w / s                                   # renormalize after exclusions
+                counts.index_add_(0, teacher_ids[b], w)     # add to vocab counts
+
+    if was_training:
+        model.train()
+    return counts
+
+def update_mask_weights_soft(mask_weights, mask_stats, mlm_prob=0.15,
+                             ema_keep=0.9,           # calmer EMA
+                             prior_count=100.0,      # shrinkage for rare tokens
+                             content_counts=None,    # vocab-sized float32 or None
+                             alpha=1.0,              # 1.0=content-only; 0.0=loss-only; in-between=blend
+                             eps=1e-6):
+    V = mask_weights.numel()
+    prior_loss = math.log(V)
+
+    # ----- robust loss-based proposal -----
+    loss_sum  = mask_stats['loss'].float()
+    count_sum = (mask_stats['total'] if 'total' in mask_stats else mask_stats['count']).float()
+
+    avg = (loss_sum + prior_count * prior_loss) / (count_sum + prior_count + eps)
+    med = avg.median()
+    mad = (avg - med).abs().median().clamp_min(eps)
+    z = ((avg - med) / (1.4826 * mad)).clamp(-3, 3)
+    diff = torch.sigmoid(z)                                  # higher = harder
+
+    w_loss = mlm_prob * (1.0 - diff)
+    w_loss = w_loss.clamp_min(0.005)
+    w_loss = mlm_prob * V * w_loss / w_loss.sum()
+
+    # ----- content-only proposal -----
+    if content_counts is not None and alpha > 0.0:
+        c = content_counts.float()
+        c = (c + 1.0) / (c.sum() + V)                        # Laplace smoothing
+        w_cnt = mlm_prob * V * c
+        w_cnt = w_cnt.clamp_min(0.005)
+        w_cnt = mlm_prob * V * w_cnt / w_cnt.sum()
+        new = (1 - alpha) * w_loss + alpha * w_cnt
+    else:
+        new = w_loss
+
+    # EMA + renorm
+    out = ema_keep * mask_weights + (1.0 - ema_keep) * new
+    out = out.clamp_min(0.005)
+    out = mlm_prob * V * out / out.sum()
+    return out
+
+# ------------------------- Utils -------------------------
 def split_batch(batch, args):
     minibatch_size = args.batch_size // args.grad_acc
     if len(batch["input_ids"]) == minibatch_size:
         return [batch]
-
     batches = []
     for i in range(0, len(batch["input_ids"]), minibatch_size):
         minibatch = {}
@@ -246,14 +334,16 @@ def move_dict_to_cuda(d):
 def move_dict_to_cuda_bf16(d):
     return {key: value.to(dtype=torch.bfloat16, device="cuda:0") for key, value in d.items()}
 
-
 def reset_stats(mask_stats):
+    # keep device/dtype
+    V = mask_stats['loss'].shape[0]
+    prior = math.log(V)
     mask_stats = {
-        'correct': torch.zeros_like(mask_stats['correct']), 
+        'correct': torch.zeros_like(mask_stats['correct']),
         'incorrect': torch.zeros_like(mask_stats['incorrect']),
-        'loss': torch.zeros_like(mask_stats['loss']) + torch.log(torch.tensor(mask_stats['loss'].shape[0])).item(),
-        'total': torch.ones_like(mask_stats['total'])
-        }
+        'loss': torch.zeros_like(mask_stats['loss']) + prior,
+        'total': torch.ones_like(mask_stats['total']),
+    }
     return mask_stats
 
 def calculate_num_words(examples):
@@ -266,7 +356,6 @@ def calculate_total_steps(args):
     def calc_exs_per_epoch(tokens_per_1000, max_seq_len):
         return sum([t // max_seq_len for t in tokens_per_1000])
 
-    
     exs_per_epoch = calc_exs_per_epoch(args.tokens_per_1000, args.init_max_seq_len)
     batches_per_epoch = math.ceil(exs_per_epoch / args.batch_size)
     cur_epoch = 0
@@ -286,30 +375,24 @@ def calculate_total_steps(args):
             batches_per_epoch = math.ceil(exs_per_epoch / batch_size)
             cur_epoch = epoch_num
             prev_seq_len = seq_len
-    
+
         total_steps = total_steps + batches_per_epoch * (args.epochs - cur_epoch)
         return total_steps
 
-
 def is_step(step_type: str, global_step: int, args):
-    # step_arg = args.logging_steps, args.save_steps, or args.eval_steps
     step_arg = getattr(args, f'{step_type}_steps')
-
     if args.all_checkpoints:
         if global_step in args.checkpoints:
             return True
     else:
         if global_step % step_arg == 0 and global_step != 0:
             return True
-        
     return False
 
-
-
+# ------------------------- Train -------------------------
 def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     if args.flops:
         from fvcore.nn import FlopCountAnalysis
-
 
     if args.lamb:
         optimizer = LAMB(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-08, weight_decay=0.1)
@@ -320,21 +403,22 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     model.train()
     model = model.to(dtype=torch.bfloat16, device="cuda:0")
 
-
-    mask_weights = torch.full((tokenizer.vocab_size,), args.mlm_prob).to(device="cuda:0")
+    mask_weights = torch.full((tokenizer.vocab_size,), args.mlm_prob, device="cuda:0")
+    # keep stats in float32 on GPU for stability
+    prior = math.log(tokenizer.vocab_size)
     mask_stats = {
-        'correct': torch.zeros(tokenizer.vocab_size, dtype=torch.float32), 
-        'incorrect': torch.zeros(tokenizer.vocab_size, dtype=torch.float32),
-        'loss': torch.zeros(tokenizer.vocab_size, dtype=torch.float32) + torch.log(torch.tensor(mask_weights.shape[0])).item(),
-        'total': torch.ones(tokenizer.vocab_size, dtype=torch.float32)
-        }
-    mask_stats = move_dict_to_cuda_bf16(mask_stats)
+        'correct': torch.zeros(tokenizer.vocab_size, dtype=torch.float32, device="cuda:0"),
+        'incorrect': torch.zeros(tokenizer.vocab_size, dtype=torch.float32, device="cuda:0"),
+        'loss': torch.zeros(tokenizer.vocab_size, dtype=torch.float32, device="cuda:0") + prior,
+        'total': torch.ones(tokenizer.vocab_size, dtype=torch.float32, device="cuda:0"),
+    }
+    # content-neighbor accumulator (full soft weighting)
+    content_counts = torch.zeros(tokenizer.vocab_size, dtype=torch.float32, device="cuda:0")
+
     if args.log_mlm_probs:
-        # create parent folder
         if not os.path.exists(args.output_path):
             os.makedirs(args.output_path)
         log_file = open(os.path.join(args.output_path, "mlm_probs.csv"), "w")
-        # get all vocab as list
         vocab_list = list(tokenizer.get_vocab().keys())
         header = ",".join(vocab_list)
         log_file.write(f"step,{header}\n")
@@ -351,19 +435,19 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                     args.max_seq_len = args.max_seq_len[1:]
 
             for step, batch in enumerate(train_dataloader):
-                masked_batch = mask_batch(batch, 
-                                          tokenizer, mask_weights.to(device="cpu"), 
-                                          mlm_prob=args.mlm_prob, 
-                                          mask_replace_prob=args.mask_replace_prob, 
-                                          random_replace_prob=args.random_replace_prob
-                                          )            
+                masked_batch = mask_batch(
+                    batch,
+                    tokenizer, mask_weights.to(device="cpu"),
+                    mlm_prob=args.mlm_prob,
+                    mask_replace_prob=args.mask_replace_prob,
+                    random_replace_prob=args.random_replace_prob
+                )
 
                 # split batch into grad_acc chunks
                 batches = split_batch(masked_batch, args)
-                
-                for minibatch in batches:
 
-                    with torch.autocast(dtype=torch.bfloat16, device_type="cuda:0"):
+                for minibatch in batches:
+                    with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
                         if args.flops:
                             model.eval()
                             flops = FlopCountAnalysis(model, tuple(move_dict_to_cuda(minibatch).values()))
@@ -374,7 +458,6 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                             print(f"Estimated Total FLOPs: {total*3*args.total_steps}")
                             exit()
 
-
                         outputs = model(**move_dict_to_cuda(minibatch))
                         loss = outputs.loss
 
@@ -383,19 +466,29 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                         with torch.no_grad():
                             if args.soft:
                                 mask_stats = get_batch_accuracy_soft(
-                                    minibatch["input_ids"].to(device="cuda:0"),
+                                    minibatch["input_ids"].to("cuda:0"),
                                     outputs.logits.detach(),
-                                    minibatch["labels"].to(device="cuda:0"),
+                                    minibatch["labels"].to("cuda:0"),
                                     mask_stats,
+                                )
+                                # content-only full-soft neighbors (cheap L0 pass)
+                                attn_mask = minibatch.get("attention_mask")
+                                if attn_mask is None:
+                                    attn_mask = (minibatch["input_ids"] != tokenizer.pad_token_id).long()
+                                content_counts += content_fullsoft_counts_first_layer(
+                                    model, tokenizer,
+                                    minibatch["input_ids"].to("cuda:0"),
+                                    minibatch["labels"].to("cuda:0"),
+                                    attention_mask=attn_mask.to("cuda:0"),
                                 )
                             else:
                                 mask_stats = get_batch_accuracy(
                                     outputs.logits.detach(),
-                                    minibatch["labels"].to(device="cuda:0"),
+                                    minibatch["labels"].to("cuda:0"),
                                     mask_stats,
                                 )
 
-                    loss = loss / args.grad_acc # To ensure consistent gradient magnitude
+                    loss = loss / args.grad_acc  # To ensure consistent gradient magnitude
                     loss.backward()
 
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -403,8 +496,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 scheduler.step()
                 optimizer.zero_grad()
 
-                # stats already updated per-minibatch; nothing to do here
-
+                # ----- UPDATE MASK WEIGHTS -----
                 if (
                     global_step % args.mask_update_steps == 0
                     and global_step != 0
@@ -412,43 +504,44 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                     and not args.regular_mlm
                 ):
                     if args.soft:
-                        mask_weights = update_mask_weights_soft(mask_weights, mask_stats, args.mlm_prob)
+                        # alpha=1.0 => pure content-only prior; set to 0.0 for loss-only robust soft
+                        mask_weights = update_mask_weights_soft(
+                            mask_weights, mask_stats, args.mlm_prob,
+                            ema_keep=0.9, prior_count=100.0,
+                            content_counts=content_counts, alpha=1.0,
+                        )
                     else:
                         mask_weights = update_mask_weights(mask_weights, mask_stats, args.mlm_prob)
 
                     if args.log_mlm_probs:
-                        # convert probs to .4f string
                         probs_str = [f"{prob.item():.4f}" for prob in mask_weights]
                         probs_str = ",".join(probs_str)
                         log_file.write(f"{global_step},{probs_str}\n")
                         log_file.flush()
-                        
 
-                    # print top 5 tokens and their probs
+                    # print top/bottom tokens for quick inspection
                     top_tokens = torch.topk(mask_weights, 5)
                     print("Top tokens: ", flush=True, end="")
                     print_str = []
                     for token, prob in zip(tokenizer.convert_ids_to_tokens(top_tokens.indices), top_tokens.values):
                         print_str.append(f"{token} ({prob.item():.2f})")
-
                     print("     ".join(print_str), flush=True)
 
-                    # print bottom 5 tokens and their probs
                     bottom_tokens = torch.topk(-mask_weights, 5)
                     print("Bottom tokens: ", flush=True, end="")
                     print_str = []
                     for token, prob in zip(tokenizer.convert_ids_to_tokens(bottom_tokens.indices), -bottom_tokens.values):
                         print_str.append(f"{token} ({prob.item():.2f})")
-
                     print("     ".join(print_str), flush=True)
 
+                    # reset accumulators
                     mask_stats = reset_stats(mask_stats)
+                    content_counts.zero_()
 
                 # ----- LOGGING -----
                 if is_step("logging", global_step, args):
                     epoch_float = global_step * args.epochs / args.total_steps
                     print(f"Epoch {epoch_float:.2f}, Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}", flush=True)
-
                     if args.wandb:
                         wandb.log({
                             "epoch": epoch_float,
@@ -460,7 +553,6 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 if is_step("eval", global_step, args):
                     metrics = evaluate(model, tokenizer, eval_dataloader, args)
                     print(f"----- Eval accuracy: {metrics['acc']:.2f}, Loss: {metrics['loss']:.4f} -----", flush=True)
-
                     if args.wandb:
                         wandb.log({
                             "eval_acc": metrics["acc"],
@@ -489,6 +581,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
     if args.wandb:
         wandb.finish()
 
+# ------------------------- Main -------------------------
 def parse_max_seq_len(max_seq_len):
     if "," in max_seq_len:
         max_seq_len = max_seq_len.split(",")
@@ -509,11 +602,10 @@ def main():
         wandb.init(
             project='babylm25',
             name=output_dir,
-            config=vars(args),   
+            config=vars(args),
         )
 
     tokenizer = DebertaV2Tokenizer(args.tokenizer, do_lower_case=args.lower)
-
     config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
 
     config.vocab_size = tokenizer.vocab_size
@@ -523,7 +615,6 @@ def main():
     config.cls_token_id = tokenizer.cls_token_id
     config.eos_token_id = tokenizer.sep_token_id
     config.sep_token_id = tokenizer.sep_token_id
-
 
     config.hidden_size = args.hidden_size
     config.intermediate_size = args.intermediate_size
@@ -539,93 +630,86 @@ def main():
     if args.pretrained:
         model = model.from_pretrained(args.model_path)
 
-
-    # print model num parameters
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Number of model parameters: {num_params}")
 
-    # for p in model.named_parameters():
-    #     print(p[0], p[1].shape)
-
     if args.custom == "pos":
         dataset = load_from_disk(args.train_data)
-        dataset['validation'] = load_dataset('text', data_files = args.valid_data)['train']
+        dataset['validation'] = load_dataset('text', data_files=args.valid_data)['train']
     else:
-        dataset = load_dataset('text', data_files = {'train': args.train_data, 'validation': args.valid_data})
+        dataset = load_dataset('text', data_files={'train': args.train_data, 'validation': args.valid_data})
 
     if args.debug:
         dataset['train'] = dataset['train'].select(range(100))
         dataset['validation'] = dataset['validation'].select(range(100))
 
-    dataset = dataset.map(tokenize, 
-        batched = True, 
-        fn_kwargs = {'tokenizer': tokenizer, 'input_field': 'text'}, 
-        remove_columns = dataset["train"].column_names, 
+    dataset = dataset.map(
+        tokenize,
+        batched=True,
+        fn_kwargs={'tokenizer': tokenizer, 'input_field': 'text'},
+        remove_columns=dataset["train"].column_names,
         num_proc=args.cpus,
-        desc = "Tokenizing",
-        # load_from_cache_file=False,
-        )
-        
-    args.dataset = dataset
+        desc="Tokenizing",
+    )
 
+    args.dataset = dataset
     print(dataset)
 
     max_seq_len = args.max_seq_len.pop(0)[1]
     args.init_max_seq_len = max_seq_len
     args.cur_max_seq_len = max_seq_len
     args.dataset_len_lines = len(dataset['train'])
-    args.tokens_per_1000 = dataset['train'].map(calculate_num_tokens, 
-                                                       batched = True,
-                                                       num_proc=args.cpus, 
-                                                       remove_columns=dataset["train"].column_names)['num_tokens']
+    args.tokens_per_1000 = dataset['train'].map(
+        calculate_num_tokens,
+        batched=True,
+        num_proc=args.cpus,
+        remove_columns=dataset["train"].column_names
+    )['num_tokens']
 
     args.dataset_len_tokens = sum(args.tokens_per_1000)
     args.total_steps = calculate_total_steps(args)
 
-    args.is_strict_small = (args.dataset_len_tokens // 10e6) < 10 # assuming there are fewer than 10 tokens per word
+    args.is_strict_small = (args.dataset_len_tokens // 10e6) < 10  # heuristic
 
     if args.is_strict_small:
         steps_1m = np.round(np.linspace(args.total_steps//100, args.total_steps//10, 10)).astype(int)
         steps_10m = np.round(np.linspace(args.total_steps//10, args.total_steps, 10)).astype(int)
         args.checkpoints = list(steps_1m) + list(steps_10m)[1:]
-    else: # strict
+    else:  # strict
         steps_1m = np.linspace(args.total_steps//1000, args.total_steps//100, 10).astype(int)
         steps_10m = np.linspace(args.total_steps//100, args.total_steps//10, 10).astype(int)
         steps_100m = np.linspace(args.total_steps//10, args.total_steps, 10).astype(int)
         args.checkpoints = list(steps_1m) + list(steps_10m)[1:] + list(steps_100m)[1:]
 
-
     print(f"Dataset length: {args.dataset_len_lines} lines, {args.dataset_len_tokens} tokens", flush=True)
     print(f"Total steps: {args.total_steps}", flush=True)
     print(f"Save checkpoints: {args.checkpoints}", flush=True)
 
-
-    grouped_dataset = dataset.map(group_texts,
-        batched = True,
-        fn_kwargs = {'max_len': max_seq_len},
-        # remove_columns = dataset["train"].column_names,
+    grouped_dataset = dataset.map(
+        group_texts,
+        batched=True,
+        fn_kwargs={'max_len': max_seq_len},
         num_proc=args.cpus,
-        desc = "Grouping",
-        # load_from_cache_file=False,
-        )
+        desc="Grouping",
+    )
 
     print("Dataset length after grouping:", len(grouped_dataset['train']))
 
     train_dataloader = torch.utils.data.DataLoader(
-        grouped_dataset['train'], 
-        batch_size=args.batch_size, 
+        grouped_dataset['train'],
+        batch_size=args.batch_size,
         num_workers=args.cpus,
-        shuffle=True, 
+        shuffle=True,
         collate_fn=padding_collate_fn
-        )
-    
+    )
+
     eval_dataloader = torch.utils.data.DataLoader(
-        grouped_dataset['validation'], 
-        batch_size=args.batch_size, 
+        grouped_dataset['validation'],
+        batch_size=args.batch_size,
         num_workers=args.cpus,
-        shuffle=False, 
+        shuffle=False,
         collate_fn=padding_collate_fn
-        )
+    )
 
     train(args, model, tokenizer, train_dataloader, eval_dataloader)
 
