@@ -28,6 +28,7 @@ All flags are explained here:
 --all_checkpoints       Save and evaluate model at multiple checkpoints (1/10/100M words) according to BabyLM requirements. Overrides eval_steps and save_steps.
 --log_mlm_probs         Log masked language model probabilities for analysis.
 --mask_update_steps     Steps between dynamic mask updates. Default: 100
+--first_mask_update     Do not perform a mask update before this global step. Default: 0
 --hidden_size           Hidden size of the model. Default: 768
 --intermediate_size     Intermediate size of the feedforward layers. Default: 3072
 --dropout               Dropout probability. Default: 0.1
