@@ -39,6 +39,7 @@ parser.add_argument("--all_checkpoints", action="store_true", help="Save and eva
                     per challenge stipulations. Overrides eval_steps and save_steps.")
 parser.add_argument("--log_mlm_probs", action="store_true", help="Log MLM probabilities for analysis")
 parser.add_argument("--mask_update_steps", type=int, default=100)
+parser.add_argument("--first_mask_update", type=int, default=0, help="Do not update mask before this global step")
 parser.add_argument("--hidden_size", type=int, default=768)
 parser.add_argument("--intermediate_size", type=int, default=3072)
 parser.add_argument("--dropout", type=float, default=0.1)
@@ -404,7 +405,12 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
                 # stats already updated per-minibatch; nothing to do here
 
-                if global_step % args.mask_update_steps == 0 and global_step != 0 and not args.regular_mlm:
+                if (
+                    global_step % args.mask_update_steps == 0
+                    and global_step != 0
+                    and global_step >= args.first_mask_update
+                    and not args.regular_mlm
+                ):
                     if args.soft:
                         mask_weights = update_mask_weights_soft(mask_weights, mask_stats, args.mlm_prob)
                     else:
