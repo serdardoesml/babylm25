@@ -321,6 +321,10 @@ def update_mask_weights_soft(mask_weights, mask_stats, mlm_prob=0.15,
     else:
         new = w_loss
 
+    floor, ceil = 0.3, 6  
+    new = new.clamp_min(floor).clamp_max(ceil)
+    new = mlm_prob * V * new / new.sum()  # renorm to keep avg mask rate
+
     # EMA + renorm
     out = ema_keep * mask_weights + (1.0 - ema_keep) * new
     out = out.clamp_min(0.005)
@@ -474,7 +478,7 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                         loss = outputs.loss
 
                     # Update stats per-minibatch and discard logits
-                    if not args.regular_mlm:
+                    if (not args.regular_mlm) and global_step >= args.first_mask_update:
                         with torch.no_grad():
                             if args.soft:
                                 mask_stats = get_batch_accuracy_soft(
@@ -512,15 +516,15 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
                 if (
                     global_step % args.mask_update_steps == 0
                     and global_step != 0
-                    and global_step >= args.first_mask_update
+                    and global_step >= (args.first_mask_update + args.mask_update_steps)
                     and not args.regular_mlm
                 ):
                     if args.soft:
                         # alpha=1.0 => pure content-only prior; set to 0.0 for loss-only robust soft
                         mask_weights = update_mask_weights_soft(
                             mask_weights, mask_stats, args.mlm_prob,
-                            ema_keep=0.9, prior_count=100.0,
-                            content_counts=content_counts, alpha=1.0,
+                            ema_keep=0.2, prior_count=150.0,
+                            content_counts=content_counts, alpha=0.5,
                         )
                     else:
                         mask_weights = update_mask_weights(mask_weights, mask_stats, args.mlm_prob)
