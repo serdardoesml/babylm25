@@ -322,10 +322,10 @@ def train(args, model, tokenizer, train_dataloader, eval_dataloader):
 
     mask_weights = torch.full((tokenizer.vocab_size,), args.mlm_prob).to(device="cuda:0")
     mask_stats = {
-        'correct': torch.zeros(tokenizer.vocab_size), 
-        'incorrect': torch.zeros(tokenizer.vocab_size),
-        'loss': torch.zeros(tokenizer.vocab_size) + torch.log(torch.tensor(mask_weights.shape[0])).item(),
-        'total': torch.ones(tokenizer.vocab_size)
+        'correct': torch.zeros(tokenizer.vocab_size, dtype=torch.float32), 
+        'incorrect': torch.zeros(tokenizer.vocab_size, dtype=torch.float32),
+        'loss': torch.zeros(tokenizer.vocab_size, dtype=torch.float32) + torch.log(torch.tensor(mask_weights.shape[0])).item(),
+        'total': torch.ones(tokenizer.vocab_size, dtype=torch.float32)
         }
     mask_stats = move_dict_to_cuda_bf16(mask_stats)
     if args.log_mlm_probs:
