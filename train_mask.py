@@ -183,16 +183,28 @@ def update_mask_weights(mask_weights, mask_stats, mlm_prob=0.15):
 def get_batch_accuracy_soft(masked_inputs, logits, labels, prev_stats):
     with torch.no_grad():
         vocab_size = logits.shape[-1]
-        loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
-        loss = loss_fn(logits.view(-1, vocab_size), labels.view(-1))
-        loss = loss.view(masked_inputs.shape)
-        # your convention: only positions that are actual [MASK] tokens
-        mask = masked_inputs == 4  # mask_token_id (kept as you prefer)
-        loss = loss[mask]
-        labels = labels[mask]
-        prev_stats['loss'].scatter_add_(0, labels, loss)
-        prev_stats['total'].scatter_add_(0, labels, torch.ones_like(loss))
+
+        # Compute CE loss in float32 for stability, independent of autocast dtype
+        loss = torch.nn.functional.cross_entropy(
+            logits.detach().float().view(-1, vocab_size),   # float32
+            labels.view(-1),
+            reduction='none'
+        ).view_as(masked_inputs)
+
+        # Your convention: only positions that are actual [MASK] tokens
+        mask = (masked_inputs == 4)
+
+        # Filter and align dtypes/devices for scatter_add_
+        loss = loss[mask].to(dtype=prev_stats['loss'].dtype, device=prev_stats['loss'].device)
+        idx  = labels[mask].to(dtype=torch.long, device=prev_stats['loss'].device)
+
+        prev_stats['loss'].scatter_add_(0, idx, loss)
+
+        ones = torch.ones_like(loss, dtype=prev_stats['total'].dtype, device=prev_stats['total'].device)
+        prev_stats['total'].scatter_add_(0, idx, ones)
+
         return prev_stats
+
 
 # ------------------------- Robust soft update + content-only prior -------------------------
 @torch.no_grad()
